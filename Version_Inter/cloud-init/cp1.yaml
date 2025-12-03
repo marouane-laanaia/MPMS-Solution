@@ -1,0 +1,55 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+
+runcmd:
+  # Désactiver swap
+  - swapoff -a
+  - sed -i '/ swap / s/^/#/' /etc/fstab
+
+  # Docker + containerd
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io
+
+  # Config containerd (FIX CRI + cgroup)
+  - containerd config default | tee /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+  - systemctl restart containerd
+  - systemctl enable containerd
+
+  # Kubernetes 1.30.14 setup
+  - mkdir -p /etc/apt/keyrings
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ ./" | tee /etc/apt/sources.list.d/kubernetes.list
+  - apt-get update
+  - apt-get install -y kubelet=1.30.14-* kubeadm=1.30.14-* kubectl=1.30.14-*
+  - apt-mark hold kubelet kubeadm kubectl
+
+  # Modules réseau
+  - echo -e "overlay\nbr_netfilter" > /etc/modules-load.d/k8s.conf
+  - modprobe overlay
+  - modprobe br_netfilter
+  - echo -e "net.bridge.bridge-nf-call-ip6tables = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.ipv4.ip_forward = 1" > /etc/sysctl.d/k8s.conf
+  - sysctl --system
+
+  # Démarrer kubelet
+  - systemctl enable --now kubelet
+
+  # Initialiser cluster (ignore erreurs CPU etc)
+  - IPADDR=$(hostname -I | awk '{print $1}')
+  - kubeadm init --kubernetes-version=v1.30.14 --apiserver-advertise-address=$IPADDR --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=all || true
+
+  # Config kubectl
+  - mkdir -p /root/.kube
+  - cp /etc/kubernetes/admin.conf /root/.kube/config || true
+
+  # Token join
+  - kubeadm token create --print-join-command > /root/join.sh || true
+  - chmod +x /root/join.sh
