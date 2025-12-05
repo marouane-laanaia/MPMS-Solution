@@ -66,6 +66,33 @@ resource "openstack_compute_instance_v2" "worker1" {
   }
 
   user_data = file("${path.module}/cloud-init/worker.yaml")
+
+  # ✅ CORRECTION: depends_on doit être ici, dans le corps de la ressource.
+  # Ceci assure que CP1 est créé avant de tenter de provisionner Worker1.
+  depends_on = [
+    openstack_compute_instance_v2.cp1
+  ]
+
+  provisioner "remote-exec" {
+    inline = [
+      # 1. Attendre un court instant pour s'assurer que CP1 a généré le token
+      "sleep 60", 
+      
+      # 2. Récupérer et exécuter le join script. Le chemin de la clé privée est corrigé ici.
+      "ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ubuntu@${openstack_compute_instance_v2.cp1.access_ip_v4} 'cat /root/join.sh' | sudo sh",
+    ]
+
+    connection {
+      # Connexion établie PAR TERRAFORM VERS LE WORKER
+      type        = "ssh"
+      user        = "ubuntu" # Utilisateur par défaut de l'image Ubuntu
+      private_key = file("~/.ssh/id_ed25519") # Chemin vers votre clé SSH privée
+      host        = self.access_ip_v4 # IP publique/flottante du Worker
+      timeout     = "5m"
+    }
+    
+    # Le depends_on n'est plus nécessaire ici
+  }
 }
 
 output "cp1_ip" {
