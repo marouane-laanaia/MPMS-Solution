@@ -25,7 +25,10 @@ data "openstack_compute_keypair_v2" "default" {
   name = "terraform"
 }
 
+
+
 # --- SECURITY GROUPS ---
+
 resource "openstack_networking_secgroup_v2" "k8s_secgroup" {
   name        = "k8s-sg"
   description = "Security group for Kubernetes cluster"
@@ -76,20 +79,56 @@ resource "openstack_networking_secgroup_rule_v2" "icmp_rule" {
   security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
 }
 
+# Accès Grafana (port 30300)
+resource "openstack_networking_secgroup_rule_v2" "grafana_rule" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 30300
+  port_range_max    = 30300
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
+}
+
+# Accès Prometheus (port 30090)
+resource "openstack_networking_secgroup_rule_v2" "prometheus_rule" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 30090
+  port_range_max    = 30090
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
+}
+
+# Accès Alertmanager (port 30093)
+resource "openstack_networking_secgroup_rule_v2" "alertmanager_rule" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 30093
+  port_range_max    = 30093
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
+}
+
+
+
+
 # --- RÉSERVATION DES ADRESSES IP (Ports) ---
 # Utilisation des ports pour IP fixes
 resource "openstack_networking_port_v2" "cp_ports" {
-  count      = 3
-  name       = "port-k8s-cp${count.index + 1}"
-  network_id = data.openstack_networking_network_v2.public.id
-
+  count              = 3
+  name               = "port-k8s-cp${count.index + 1}"
+  network_id         = data.openstack_networking_network_v2.public.id
+  security_group_ids = [openstack_networking_secgroup_v2.k8s_secgroup.id]
 }
 
 resource "openstack_networking_port_v2" "worker_ports" {
-  count      = 3
-  name       = "port-k8s-worker${count.index + 1}"
-  network_id = data.openstack_networking_network_v2.public.id
-
+  count              = 3
+  name               = "port-k8s-worker${count.index + 1}"
+  network_id         = data.openstack_networking_network_v2.public.id
+  security_group_ids = [openstack_networking_secgroup_v2.k8s_secgroup.id]
 }
 
 # --- Délai d'attente pour le Control Plane 1 ---
@@ -110,6 +149,8 @@ resource "openstack_blockstorage_volume_v3" "worker_data" {
   name  = "k8s-worker${count.index + 1}-data"
   size  = 8
 }
+
+
 
 # --- CONTROL PLANES ---
 resource "openstack_compute_instance_v2" "cp" {
@@ -215,4 +256,93 @@ resource "null_resource" "worker_join" {
       "ssh -o StrictHostKeyChecking=no -i /home/ubuntu/.ssh/id_ed25519 ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-worker.sh' | sudo bash -x",
     ]
   }
+}
+
+
+# --- DÉPLOIEMENT PROMETHEUS + GRAFANA ---
+resource "null_resource" "deploy_monitoring" {
+  depends_on = [
+    time_sleep.wait_for_cp_boot,
+    null_resource.worker_join
+  ]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file("~/.ssh/id_ed25519")
+    host        = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      # Attendre que le cluster soit stable
+      "echo 'Attente de la stabilité du cluster...'",
+      "sleep 30",
+
+      # Installation de Helm si pas déjà fait
+      "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash || true",
+
+      # Création du namespace monitoring
+      "kubectl create namespace monitoring || true",
+
+      # Ajout du repo Prometheus Community
+      "helm repo add prometheus-community https://prometheus-community.github.io/helm-charts",
+      "helm repo update",
+
+      # Installation de kube-prometheus-stack
+      "helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \\",
+      "  --namespace monitoring \\",
+      "  --set prometheus.prometheusSpec.retention=15d \\",
+      "  --set prometheus.service.type=NodePort \\",
+      "  --set prometheus.service.nodePort=30090 \\",
+      "  --set grafana.service.type=NodePort \\",
+      "  --set grafana.service.nodePort=30300 \\",
+      "  --set grafana.adminPassword=admin123 \\",
+      "  --set alertmanager.service.type=NodePort \\",
+      "  --set alertmanager.service.nodePort=30093 \\",
+      "  --timeout 10m \\",
+      "  --wait",
+
+      # Afficher les infos de connexion
+      "echo ''",
+      "echo '========================================='",
+      "echo 'MONITORING STACK DEPLOYED'",
+      "echo '========================================='",
+      "echo 'Grafana URL: http://${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}:30300'",
+      "echo 'Grafana User: admin'",
+      "echo 'Grafana Password: admin123'",
+      "echo ''",
+      "echo 'Prometheus URL: http://${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}:30090'",
+      "echo ''",
+      "echo 'Alertmanager URL: http://${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}:30093'",
+      "echo '========================================='",
+
+      # Sauvegarder les infos
+      "cat > /home/ubuntu/monitoring-info.txt <<EOF",
+      "Grafana URL: http://${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}:30300",
+      "Grafana User: admin",
+      "Grafana Password: admin123",
+      "echo ''",
+      "Prometheus URL: http://${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}:30090",
+      "Alertmanager URL: http://${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}:30093",
+      "EOF"
+    ]
+  }
+}
+
+
+# --- OUTPUTS ---
+output "grafana_url" {
+  value       = "http://${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}:30300"
+  description = "Grafana URL (admin/admin123)"
+}
+
+output "prometheus_url" {
+  value       = "http://${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}:30090"
+  description = "Prometheus URL"
+}
+
+output "cp1_ip" {
+  value       = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
+  description = "Control Plane 1 IP"
 }
