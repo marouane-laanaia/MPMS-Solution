@@ -18,144 +18,149 @@ data "openstack_networking_network_v2" "public" {
 
 data "openstack_images_image_v2" "ubuntu" {
   most_recent = true
-  name        = "Ubuntu 22.04"
+  name        = "Ubuntu-22.04"
 }
 
 data "openstack_compute_keypair_v2" "default" {
   name = "terraform"
 }
 
-# --- Délai d'attente fixe pour la stabilisation du Control Plane ---
-# 6 minutes pour garantir que kubeadm init et le CNI sont terminés sur CP1.
-resource "time_sleep" "wait_for_cp_boot" {
-  create_duration = "6m" 
-  
-  depends_on = [
-    openstack_compute_instance_v2.cp[0]
-  ]
+# --- RÉSERVATION DES ADRESSES IP (Ports) ---
+# On enlève security_group_ids pour laisser OpenStack mettre le 'default' de ton projet
+
+resource "openstack_networking_port_v2" "cp_ports" {
+  count      = 3
+  name       = "port-k8s-cp${count.index + 1}"
+  network_id = data.openstack_networking_network_v2.public.id
+
+  allowed_address_pairs {
+    ip_address = "10.202.22.240/28"
+  }
 }
 
-# --- CONTROL PLANES (3 Instances) ---
+resource "openstack_networking_port_v2" "worker_ports" {
+  count      = 3
+  name       = "port-k8s-worker${count.index + 1}"
+  network_id = data.openstack_networking_network_v2.public.id
+
+  allowed_address_pairs {
+    ip_address = "10.202.22.240/28"
+  }
+}
+
+# --- Délai d'attente pour le Control Plane 1 ---
+resource "time_sleep" "wait_for_cp_boot" {
+  create_duration = "8m" 
+  depends_on      = [openstack_compute_instance_v2.cp[0]]
+}
+
+# --- VOLUMES (8Go pour économiser ton quota) ---
 resource "openstack_blockstorage_volume_v3" "cp_data" {
   count = 3
-  name = "k8s-cp${count.index + 1}-data"
-  size = 20
+  name  = "k8s-cp${count.index + 1}-data"
+  size  = 8
 }
 
-resource "openstack_compute_instance_v2" "cp" {
+resource "openstack_blockstorage_volume_v3" "worker_data" {
   count = 3
-  name            = "k8s-cp${count.index + 1}"
-  flavor_name     = "m1.small"
-  key_pair        = data.openstack_compute_keypair_v2.default.name
-  security_groups = ["default"]
-  image_id        = data.openstack_images_image_v2.ubuntu.id
+  name  = "k8s-worker${count.index + 1}-data"
+  size  = 8
+}
+
+# --- CONTROL PLANES ---
+resource "openstack_compute_instance_v2" "cp" {
+  count       = 3
+  name        = "k8s-cp${count.index + 1}"
+  flavor_name = "m1.small"
+  key_pair    = data.openstack_compute_keypair_v2.default.name
+  image_id    = data.openstack_images_image_v2.ubuntu.id
+  
+  config_drive = true
 
   network {
-    uuid = data.openstack_networking_network_v2.public.id
+    port = openstack_networking_port_v2.cp_ports[count.index].id
   }
 
   volume {
     volume_id = openstack_blockstorage_volume_v3.cp_data[count.index].id
   }
 
-  user_data = file("${path.module}/cloud-init/cp1.yaml")
+  user_data = count.index == 0 ? templatefile("${path.module}/cloud-init/cp1.sh", {
+    control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
+  }) : templatefile("${path.module}/cloud-init/worker.sh", {
+    control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
+  })
+  
 }
 
-# Ressource NULL pour joindre CP2 et CP3 (index > 0)
-resource "null_resource" "cp_join" {
-  count = length(openstack_compute_instance_v2.cp) > 1 ? length(openstack_compute_instance_v2.cp) - 1 : 0
-  
-  depends_on = [
-    time_sleep.wait_for_cp_boot 
-  ]
-  
-  connection {
-    type        = "ssh"
-    user        = "ubuntu"
-    private_key = file("~/.ssh/id_ed25519")
-    host        = openstack_compute_instance_v2.cp[count.index + 1].access_ip_v4 
-    timeout     = "5m"
-  }
-
-  # NOUVEAU : Transférer la clé SSH privée (~/.ssh/id_ed25519) sur le noeud CP cible
-  provisioner "file" {
-    source      = "~/.ssh/id_ed25519"
-    destination = "/home/ubuntu/.ssh/id_ed25519"
-  }
-  
-  provisioner "remote-exec" {
-    inline = [
-      # 1. Rendre la clé non accessible aux autres (important pour SSH)
-      "chmod 600 /home/ubuntu/.ssh/id_ed25519",
-      # 2. Exécuter la commande SSH imbriquée (utilise la clé nouvellement copiée)
-      "ssh -o StrictHostKeyChecking=no -i /home/ubuntu/.ssh/id_ed25519 ubuntu@${openstack_compute_instance_v2.cp[0].access_ip_v4} 'sudo cat /root/join.sh | grep control-plane' | sudo sh",
-    ]
-  }
-}
-
-# --- WORKER NODES (3 Instances) ---
-resource "openstack_blockstorage_volume_v3" "worker_data" {
-  count = 3
-  name = "k8s-worker${count.index + 1}-data"
-  size = 20
-}
-
+# --- WORKER NODES ---
 resource "openstack_compute_instance_v2" "worker" {
-  count = 3
-  name            = "k8s-worker${count.index + 1}"
-  flavor_name     = "m1.small"
-  key_pair        = data.openstack_compute_keypair_v2.default.name
-  security_groups = ["default"]
-  image_id        = data.openstack_images_image_v2.ubuntu.id
+  count       = 3
+  name        = "k8s-worker${count.index + 1}"
+  flavor_name = "m1.small"
+  key_pair    = data.openstack_compute_keypair_v2.default.name
+  image_id    = data.openstack_images_image_v2.ubuntu.id
+  
+  config_drive = true
 
   network {
-    uuid = data.openstack_networking_network_v2.public.id
+    port = openstack_networking_port_v2.worker_ports[count.index].id
   }
 
   volume {
     volume_id = openstack_blockstorage_volume_v3.worker_data[count.index].id
   }
 
-  user_data = file("${path.module}/cloud-init/worker.yaml")
+  user_data = templatefile("${path.module}/cloud-init/worker.sh", {
+  control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
+  })
+
 }
 
-# Ressource NULL pour joindre les 3 Workers
-resource "null_resource" "worker_join" {
-  count = 3
-
-  depends_on = [
-    time_sleep.wait_for_cp_boot 
-  ]
+# --- JOINTURE CP ---
+resource "null_resource" "cp_join" {
+  count      = 2
+  depends_on = [time_sleep.wait_for_cp_boot]
 
   connection {
     type        = "ssh"
     user        = "ubuntu"
     private_key = file("~/.ssh/id_ed25519")
-    host        = openstack_compute_instance_v2.worker[count.index].access_ip_v4 
-    timeout     = "5m"
-  }
-  
-  # NOUVEAU : Transférer la clé SSH privée (~/.ssh/id_ed25519) sur le noeud Worker cible
-  provisioner "file" {
-    source      = "~/.ssh/id_ed25519"
-    destination = "/home/ubuntu/.ssh/id_ed25519"
+    host        = openstack_networking_port_v2.cp_ports[count.index + 1].all_fixed_ips[0]
   }
 
   provisioner "remote-exec" {
     inline = [
-      # 1. Rendre la clé non accessible aux autres (important pour SSH)
+      "timeout 300s bash -c 'until command -v kubeadm >/dev/null 2>&1; do echo \"Attente installation kubeadm...\"; sleep 10; done'",
+      "mkdir -p /home/ubuntu/.ssh",
+      "echo '${file("~/.ssh/id_ed25519")}' > /home/ubuntu/.ssh/id_ed25519",
       "chmod 600 /home/ubuntu/.ssh/id_ed25519",
-      # 2. Exécuter la commande SSH imbriquée (utilise la clé nouvellement copiée)
-      "ssh -o StrictHostKeyChecking=no -i /home/ubuntu/.ssh/id_ed25519 ubuntu@${openstack_compute_instance_v2.cp[0].access_ip_v4} 'sudo cat /root/join.sh | grep -v control-plane' | sudo sh",
+      "while ! ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo test -f /root/join-cp.sh'; do sleep 10; done",
+      "ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-cp.sh' | sed 's/kubeadm join/kubeadm join --ignore-preflight-errors=NumCPU/' | sudo bash"
     ]
   }
 }
 
-# --- OUTPUTS ---
-output "cp_ips" {
-  value = openstack_compute_instance_v2.cp[*].access_ip_v4
-}
+# --- JOINTURE WORKERS ---
+resource "null_resource" "worker_join" {
+  count      = 3
+  depends_on = [time_sleep.wait_for_cp_boot]
 
-output "worker_ips" {
-  value = openstack_compute_instance_v2.worker[*].access_ip_v4
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file("~/.ssh/id_ed25519")
+    host        = openstack_networking_port_v2.worker_ports[count.index].all_fixed_ips[0]
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "timeout 300s bash -c 'until command -v kubeadm >/dev/null 2>&1; do echo \"Attente installation kubeadm...\"; sleep 10; done'",
+      "mkdir -p /home/ubuntu/.ssh",
+      "echo '${file("~/.ssh/id_ed25519")}' > /home/ubuntu/.ssh/id_ed25519",
+      "chmod 600 /home/ubuntu/.ssh/id_ed25519",
+      "while ! ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo test -f /root/join-worker.sh'; do sleep 10; done",
+      "ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-worker.sh' | sudo bash"
+    ]
+  }
 }
