@@ -167,9 +167,9 @@ resource "openstack_compute_instance_v2" "cp" {
   }
 
 
-  user_data = count.index == 0 ? templatefile("${path.module}/cloud-init/cp1.yaml", {
+  user_data = count.index == 0 ? templatefile("${path.module}/cloud-init/cp1.sh", {
     control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
-    }) : templatefile("${path.module}/cloud-init/worker.yaml", {
+    }) : templatefile("${path.module}/cloud-init/worker.sh", {
     control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
   })
 }
@@ -195,7 +195,7 @@ resource "openstack_compute_instance_v2" "worker" {
   }
 
 
-  user_data = templatefile("${path.module}/cloud-init/worker.yaml", {
+  user_data = templatefile("${path.module}/cloud-init/worker.sh", {
     control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
   })
 }

@@ -1,2 +1,12 @@
-Infra_MAJ/terraform.tfstate
-Infra_MAJ/clouds.yaml
+# Terraform state and backups
+*.tfstate
+*.tfstate.backup
+
+# Terraform local directories
+.terraform/
+
+# Cloud secrets
+clouds.yaml
+
+# Crash logs
+crash.log
